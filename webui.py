@@ -24,72 +24,113 @@ from modules.ui_gradio_extensions import reload_javascript
 from modules.auth import auth_enabled, check_auth
 from modules.util import is_json
 
-def get_task(*args):
-    args = list(args)
-    args.pop(0)
+import cv2
+import numpy as np
 
-    return worker.AsyncTask(args=args)
+def load_inpaint_input_image(image_path):
+    """
+    读取原图，并返回:
+      {
+        "image": image_rgb,   # shape(H,W,3)
+        "mask":  zeros(同大小) # shape(H,W,3), 全0
+      }
+    """
+    # 加载原图(bgr)
+    image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise ValueError(f"Cannot open image: {image_path}")
+    # 转成RGB
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    # 构造与image_rgb相同大小、全零的3通道Mask
+    mask_3ch = np.zeros_like(image_rgb, dtype=np.uint8)
+
+    return {
+        "image": image_rgb,
+        "mask":  mask_3ch
+    }
+
+def load_inpaint_mask_upload(mask_path, shape=None):
+    """
+    读取mask文件，并返回:
+      {
+        "image": zeros(指定shape), # shape(H,W,3), 全0
+        "mask":  mask_3ch          # shape(H,W,3), 白色区域=255
+      }
+    shape: 若你需要跟特定分辨率对齐，可传个(H,W)进来，否则就跟mask自己大小一致
+    """
+
+    # 加载灰度mask
+    mask_gray = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask_gray is None:
+        raise ValueError(f"Cannot open mask: {mask_path}")
+    mask_3ch = cv2.cvtColor(mask_gray, cv2.COLOR_GRAY2RGB)
+
+    # 如果需要特定shape，就resize
+    if shape is not None:
+        H, W = shape
+        mask_3ch = cv2.resize(mask_3ch, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    # 构造同mask大小、全零的图像
+    zeros_image = np.zeros_like(mask_3ch, dtype=np.uint8)
+
+    return {
+        "image": zeros_image,
+        "mask":  mask_3ch
+    }
+
+def get_task(*t):
+    original_image = load_inpaint_input_image("./images/naimi1.jpg")
+    mask_image = load_inpaint_mask_upload("./images/mask.png")
+    t = (worker.AsyncTask(args=[]), False, 'remove', '', ['Fooocus V2', 'Fooocus Enhance', 'Fooocus Sharp'], 'Quality', '1152×896 <span style="color: grey;"> ∣ 9:7</span>', 1, 'jpeg', '8237868315817521040', False, 2, 4, 'realismEngineSDXL_v30VAE.safetensors', 'None', 0.5, True, 'sd_xl_offset_example-lora_1.0.safetensors', 0.1, True, 'None', 1, True, 'None', 1, True, 'None', 1, True, 'None', 1, True, 'inpaint', 'Disabled', None, [], original_image, '',  mask_image, False, False, False, False, 1.5, 0.8, 0.3, 7, 2, 'dpmpp_2m_sde_gpu', 'karras', 'Default (model)', -1, -1, -1, -1, -1, -1, False, False, False, False, 64, 128, 'joint', 0.25, False, 1.01, 1.02, 0.99, 0.95, False, False, 'v2.6', 1, 0.618, True, False, 0, False, False, 'fooocus', None, 0.5, 0.6, 'ImagePrompt', None, 0.5, 0.6, 'ImagePrompt', None, 0.5, 0.6, 'ImagePrompt', None, 0.5, 0.6, 'ImagePrompt', False, 0, False, None, False, 'Disabled', 'Before First Enhancement', 'Original Prompts', False, '', '', '', 'sam', 'full', 'vit_b', 0.25, 0.3, 0, False, 'v2.6', 1, 0.618, 0, False, False, '', '', '', 'sam', 'full', 'vit_b', 0.25, 0.3, 0, False, 'v2.6', 1, 0.618, 0, False, False, '', '', '', 'sam', 'full', 'vit_b', 0.25, 0.3, 0, False, 'v2.6', 1, 0.618, 0, False)
+    t = list(t)
+    t.pop(0)
+    return worker.AsyncTask(args=t)
 
 def generate_clicked(task: worker.AsyncTask):
-    import ldm_patched.modules.model_management as model_management
+    import os
+    import time
+    import copy
 
-    with model_management.interrupt_processing_mutex:
-        model_management.interrupt_processing = False
-    # outputs=[progress_html, progress_window, progress_gallery, gallery]
+    images_dir = os.environ['TARGET_IMAGES_DIR']
+    masks_dir = os.environ['TARGET_MASKS_DIR']
 
-    if len(task.args) == 0:
+    all_images = []
+    for filename1 in os.listdir(images_dir):
+        if filename1.lower().endswith(('.png', '.jpg', '.jpeg')):
+            image_path = os.path.join(images_dir, filename1)
+            mask_filename = 'mask_' + filename1.rsplit('.', 1)[0] + '.jpg'
+            mask_path = os.path.join(masks_dir, mask_filename)
+
+            print(mask_path)
+            if os.path.exists(mask_path):
+                all_images.append((image_path, mask_path))
+            else:
+                print(f"[Warn] mask not found for {filename1}")
+    if not all_images:
+        print("No matching (image,mask) found. Stop.")
         return
 
-    execution_start_time = time.perf_counter()
-    finished = False
+    start_time = time.time()
+    count = 0
+    for (image_path, mask_path) in all_images:
+        new_args = copy.deepcopy(task.args)
+        new_args.append(image_path)
 
-    yield gr.update(visible=True, value=modules.html.make_progress_html(1, 'Waiting for task to start ...')), \
-        gr.update(visible=True, value=None), \
-        gr.update(visible=False, value=None), \
-        gr.update(visible=False)
+        original_image_index = 35
+        mask_image_index = 37
 
-    worker.async_tasks.append(task)
+        new_args[original_image_index] = load_inpaint_input_image(image_path)
+        new_args[mask_image_index] = load_inpaint_mask_upload(mask_path)
 
-    while not finished:
-        time.sleep(0.01)
-        if len(task.yields) > 0:
-            flag, product = task.yields.pop(0)
-            if flag == 'preview':
+        new_task = worker.AsyncTask(args=new_args)
 
-                # help bad internet connection by skipping duplicated preview
-                if len(task.yields) > 0:  # if we have the next item
-                    if task.yields[0][0] == 'preview':   # if the next item is also a preview
-                        # print('Skipped one preview for better internet connection.')
-                        continue
+        worker.async_tasks.append(new_task)
+        count += 1
 
-                percentage, title, image = product
-                yield gr.update(visible=True, value=modules.html.make_progress_html(percentage, title)), \
-                    gr.update(visible=True, value=image) if image is not None else gr.update(), \
-                    gr.update(), \
-                    gr.update(visible=False)
-            if flag == 'results':
-                yield gr.update(visible=True), \
-                    gr.update(visible=True), \
-                    gr.update(visible=True, value=product), \
-                    gr.update(visible=False)
-            if flag == 'finish':
-                if not args_manager.args.disable_enhance_output_sorting:
-                    product = sort_enhance_images(product, task)
+    end_time = time.time()
+    print(f"Added {count} tasks to queue, took {end_time - start_time:.2f}s total.")
 
-                yield gr.update(visible=False), \
-                    gr.update(visible=False), \
-                    gr.update(visible=False), \
-                    gr.update(visible=True, value=product)
-                finished = True
-
-                # delete Fooocus temp images, only keep gradio temp images
-                if args_manager.args.disable_image_log:
-                    for filepath in product:
-                        if isinstance(filepath, str) and os.path.exists(filepath):
-                            os.remove(filepath)
-
-    execution_time = time.perf_counter() - execution_start_time
-    print(f'Total time: {execution_time:.2f} seconds')
     return
 
 
@@ -654,6 +695,7 @@ with shared.gradio_root:
             with gr.Tab(label='Models'):
                 with gr.Group():
                     with gr.Row():
+                        # @learning select base model
                         base_model = gr.Dropdown(label='Base Model (SDXL only)', choices=modules.config.model_filenames, value=modules.config.default_base_model_name, show_label=True)
                         refiner_model = gr.Dropdown(label='Refiner (SDXL or SD 1.5)', choices=['None'] + modules.config.model_filenames, value=modules.config.default_refiner_model_name, show_label=True)
 
@@ -1038,15 +1080,16 @@ with shared.gradio_root:
         metadata_import_button.click(trigger_metadata_import, inputs=[metadata_input_image, state_is_generating], outputs=load_data_outputs, queue=False, show_progress=True) \
             .then(style_sorter.sort_styles, inputs=style_selections, outputs=style_selections, queue=False, show_progress=False)
 
+        # @learning load base model
         generate_button.click(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), [], True),
                               outputs=[stop_button, skip_button, generate_button, gallery, state_is_generating]) \
             .then(fn=refresh_seed, inputs=[seed_random, image_seed], outputs=image_seed) \
             .then(fn=get_task, inputs=ctrls, outputs=currentTask) \
-            .then(fn=generate_clicked, inputs=currentTask, outputs=[progress_html, progress_window, progress_gallery, gallery]) \
-            .then(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), False),
-                  outputs=[generate_button, stop_button, skip_button, state_is_generating]) \
-            .then(fn=update_history_link, outputs=history_link) \
-            .then(fn=lambda: None, _js='playNotification').then(fn=lambda: None, _js='refresh_grid_delayed')
+            .then(fn=generate_clicked, inputs=currentTask) \
+            # .then(lambda: (gr.update(visible=True, interactive=True), gr.update(visible=False, interactive=False), gr.update(visible=False, interactive=False), False),
+            #       outputs=[generate_button, stop_button, skip_button, state_is_generating]) \
+            # .then(fn=update_history_link, outputs=history_link) \
+            # .then(fn=lambda: None, _js='playNotification').then(fn=lambda: None, _js='refresh_grid_delayed')
 
         reset_button.click(lambda: [worker.AsyncTask(args=[]), False, gr.update(visible=True, interactive=True)] +
                                    [gr.update(visible=False)] * 6 +

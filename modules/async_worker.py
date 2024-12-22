@@ -4,6 +4,10 @@ from extras.inpaint_mask import generate_mask_from_image, SAMOptions
 from modules.patch import PatchSettings, patch_settings, patch_all
 import modules.config
 
+from typing import Optional, List, Tuple
+
+last_pipeline_config: Optional[Tuple] = None
+
 patch_all()
 
 
@@ -157,6 +161,9 @@ class AsyncTask:
         self.should_enhance = self.enhance_checkbox and (self.enhance_uov_method != disabled.casefold() or len(self.enhance_ctrls) > 0)
         self.images_to_enhance_count = 0
         self.enhance_stats = {}
+
+        if len(args) > 0:
+            self.original_path = args.pop()
 
 async_tasks = []
 
@@ -335,61 +342,17 @@ def worker():
         )
 
     def save_and_log(async_task, height, imgs, task, use_expansion, width, loras, persist_image=True) -> list:
+        from PIL import Image
+
         img_paths = []
-        for x in imgs:
-            d = [('Prompt', 'prompt', task['log_positive_prompt']),
-                 ('Negative Prompt', 'negative_prompt', task['log_negative_prompt']),
-                 ('Fooocus V2 Expansion', 'prompt_expansion', task['expansion']),
-                 ('Styles', 'styles',
-                  str(task['styles'] if not use_expansion else [fooocus_expansion] + task['styles'])),
-                 ('Performance', 'performance', async_task.performance_selection.value),
-                 ('Steps', 'steps', async_task.steps),
-                 ('Resolution', 'resolution', str((width, height))),
-                 ('Guidance Scale', 'guidance_scale', async_task.cfg_scale),
-                 ('Sharpness', 'sharpness', async_task.sharpness),
-                 ('ADM Guidance', 'adm_guidance', str((
-                     modules.patch.patch_settings[pid].positive_adm_scale,
-                     modules.patch.patch_settings[pid].negative_adm_scale,
-                     modules.patch.patch_settings[pid].adm_scaler_end))),
-                 ('Base Model', 'base_model', async_task.base_model_name),
-                 ('Refiner Model', 'refiner_model', async_task.refiner_model_name),
-                 ('Refiner Switch', 'refiner_switch', async_task.refiner_switch)]
+        overwrite_path = async_task.original_path
 
-            if async_task.refiner_model_name != 'None':
-                if async_task.overwrite_switch > 0:
-                    d.append(('Overwrite Switch', 'overwrite_switch', async_task.overwrite_switch))
-                if async_task.refiner_swap_method != flags.refiner_swap_method:
-                    d.append(('Refiner Swap Method', 'refiner_swap_method', async_task.refiner_swap_method))
-            if modules.patch.patch_settings[pid].adaptive_cfg != modules.config.default_cfg_tsnr:
-                d.append(
-                    ('CFG Mimicking from TSNR', 'adaptive_cfg', modules.patch.patch_settings[pid].adaptive_cfg))
-
-            if async_task.clip_skip > 1:
-                d.append(('CLIP Skip', 'clip_skip', async_task.clip_skip))
-            d.append(('Sampler', 'sampler', async_task.sampler_name))
-            d.append(('Scheduler', 'scheduler', async_task.scheduler_name))
-            d.append(('VAE', 'vae', async_task.vae_name))
-            d.append(('Seed', 'seed', str(task['task_seed'])))
-
-            if async_task.freeu_enabled:
-                d.append(('FreeU', 'freeu',
-                          str((async_task.freeu_b1, async_task.freeu_b2, async_task.freeu_s1, async_task.freeu_s2))))
-
-            for li, (n, w) in enumerate(loras):
-                if n != 'None':
-                    d.append((f'LoRA {li + 1}', f'lora_combined_{li + 1}', f'{n} : {w}'))
-
-            metadata_parser = None
-            if async_task.save_metadata_to_images:
-                metadata_parser = modules.meta_parser.get_metadata_parser(async_task.metadata_scheme)
-                metadata_parser.set_data(task['log_positive_prompt'], task['positive'],
-                                         task['log_negative_prompt'], task['negative'],
-                                         async_task.steps, async_task.base_model_name, async_task.refiner_model_name,
-                                         loras, async_task.vae_name)
-            d.append(('Metadata Scheme', 'metadata_scheme',
-                      async_task.metadata_scheme.value if async_task.save_metadata_to_images else async_task.save_metadata_to_images))
-            d.append(('Version', 'version', 'Fooocus v' + fooocus_version.version))
-            img_paths.append(log(x, d, metadata_parser, async_task.output_format, task, persist_image))
+        for i, x in enumerate(imgs):
+            local_path = overwrite_path
+            image = Image.fromarray(x)
+            image.save(local_path)
+            print(f"[save_and_log] Overwrote {local_path}")
+            img_paths.append(local_path)
 
         return img_paths
 
@@ -640,6 +603,8 @@ def worker():
 
     def process_prompt(async_task, prompt, negative_prompt, base_model_additional_loras, image_number, disable_seed_increment, use_expansion, use_style,
                        use_synthetic_refiner, current_progress, advance_progress=False):
+        global last_pipeline_config
+
         prompts = remove_empty_str([safe_str(p) for p in prompt.splitlines()], default='')
         negative_prompts = remove_empty_str([safe_str(p) for p in negative_prompt.splitlines()], default='')
         prompt = prompts[0]
@@ -658,11 +623,28 @@ def worker():
                                                           modules.config.default_max_lora_number,
                                                           lora_filenames=lora_filenames)
         loras += async_task.performance_loras
+
+        current_config = (
+            async_task.refiner_model_name,
+            async_task.base_model_name,
+            tuple(sorted(loras)) if isinstance(loras, list) else loras,
+            tuple(sorted(base_model_additional_loras)) if base_model_additional_loras else (),
+            use_synthetic_refiner,
+            async_task.vae_name
+        )
+
+        # if current_config == last_pipeline_config:
+        #     print("[refresh_everything] Pipeline config unchanged, skip refresh.")
+        # else:
         pipeline.refresh_everything(refiner_model_name=async_task.refiner_model_name,
                                     base_model_name=async_task.base_model_name,
                                     loras=loras, base_model_additional_loras=base_model_additional_loras,
                                     use_synthetic_refiner=use_synthetic_refiner, vae_name=async_task.vae_name)
         pipeline.set_clip_skip(async_task.clip_skip)
+            # print("[refresh_everything] Pipeline config changed, refreshing...")
+
+        # last_pipeline_config = current_config
+
         if advance_progress:
             current_progress += 1
         progressbar(async_task, current_progress, 'Processing prompts ...')
@@ -876,7 +858,7 @@ def worker():
                 if isinstance(async_task.inpaint_mask_image_upload,
                               np.ndarray) and async_task.inpaint_mask_image_upload.ndim == 3:
                     H, W, C = inpaint_image.shape
-                    async_task.inpaint_mask_image_upload = resample_image(async_task.inpaint_mask_image_upload,
+                    async_task.inpainqt_mask_image_upload = resample_image(async_task.inpaint_mask_image_upload,
                                                                           width=W, height=H)
                     async_task.inpaint_mask_image_upload = np.mean(async_task.inpaint_mask_image_upload, axis=2)
                     async_task.inpaint_mask_image_upload = (async_task.inpaint_mask_image_upload > 127).astype(
